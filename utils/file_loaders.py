@@ -8,19 +8,12 @@ import pandas as pd
 def _safe_str(val):
     if val is None:
         return ""
-    # Handle pandas NA types (pd.NA, pd.NaT, np.nan, pyarrow NA)
-    if val is pd.NA:
-        return ""
     try:
         if pd.isna(val):
             return ""
     except (TypeError, ValueError):
         pass
-    s = str(val).strip()
-    # Treat string representations of null as empty
-    if s.lower() in ("<na>", "nan", "none", "nat", "null"):
-        return ""
-    return s
+    return str(val).strip()
 
 
 def _read_file(file, header_row=0, skiprows=None):
@@ -33,8 +26,13 @@ def _read_file(file, header_row=0, skiprows=None):
         if name.endswith(".csv"):
             return pd.read_csv(io.BytesIO(raw), header=header_row,
                                skiprows=skiprows, dtype=str)
-        return pd.read_excel(io.BytesIO(raw), header=header_row,
-                             skiprows=skiprows, dtype=str)
+        try:
+            import python_calamine
+            return pd.read_excel(io.BytesIO(raw), header=header_row,
+                                 skiprows=skiprows, dtype=str, engine="calamine")
+        except ImportError:
+            return pd.read_excel(io.BytesIO(raw), header=header_row,
+                                 skiprows=skiprows, dtype=str)
     except Exception:
         return pd.DataFrame()
 
@@ -49,13 +47,18 @@ def _read_zip(file, header_row=0, skiprows=None):
                 with zf.open(name) as f:
                     data = f.read()
                     try:
-                        if name.lower().endswith(".csv"):
-                            df = pd.read_csv(io.BytesIO(data), header=header_row,
-                                             skiprows=skiprows, dtype=str)
-                        else:
-                            df = pd.read_excel(io.BytesIO(data), header=header_row,
-                                               skiprows=skiprows, dtype=str)
-                        frames.append(df)
+                         if name.lower().endswith(".csv"):
+                             df = pd.read_csv(io.BytesIO(data), header=header_row,
+                                              skiprows=skiprows, dtype=str)
+                         else:
+                             try:
+                                 import python_calamine
+                                 df = pd.read_excel(io.BytesIO(data), header=header_row,
+                                                    skiprows=skiprows, dtype=str, engine="calamine")
+                             except ImportError:
+                                 df = pd.read_excel(io.BytesIO(data), header=header_row,
+                                                    skiprows=skiprows, dtype=str)
+                         frames.append(df)
                     except Exception:
                         continue
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -245,26 +248,12 @@ def _parse_shopee_single(raw_bytes, filename_lower):
     return pd.DataFrame()
 
 
-def _force_str_dtype(df):
-    """
-    Convert all DataFrame columns to Python object dtype (plain str/None).
-    Prevents pyarrow StringArray NA issues where pd.NA is not caught by
-    pd.isna() in lambda functions on Python 3.14 / pandas 3.x.
-    """
-    for col in df.columns:
-        try:
-            df[col] = df[col].astype(object)
-        except Exception:
-            pass
-    return df
-
-
 def _load_shopee_raw(file):
     """
     Load Shopee file — supports:
     - ZIP containing multiple xlsx files (reads ALL, consolidates)
     - Single xlsx or csv file
-    Returns one consolidated DataFrame with all columns as object dtype.
+    Returns one consolidated DataFrame.
     """
     if file is None:
         return pd.DataFrame()
@@ -283,16 +272,15 @@ def _load_shopee_raw(file):
                             entry_bytes = f.read()
                         df = _parse_shopee_single(entry_bytes, entry.lower())
                         if not df.empty:
-                            frames.append(_force_str_dtype(df))
+                            frames.append(df)
         except Exception:
             return pd.DataFrame()
         if not frames:
             return pd.DataFrame()
         combined = pd.concat(frames, ignore_index=True)
-        return _normalise_cols(_force_str_dtype(combined))
+        return _normalise_cols(combined)
     else:
-        df = _parse_shopee_single(raw, name)
-        return _force_str_dtype(df)
+        return _parse_shopee_single(raw, name)
 
 
 def load_shopee_stock(file, country):
@@ -670,24 +658,37 @@ def load_tc_inventory(file):
     """
     if file is None:
         return pd.DataFrame()
-    df = pd.DataFrame()
     raw  = file.read()
     name = file.name.lower()
     file.seek(0)
-    for header_row in [0, 1, 2]:
-        try:
-            if name.endswith(".csv"):
-                tmp = pd.read_csv(io.BytesIO(raw), header=header_row, dtype=str)
-            else:
-                tmp = pd.read_excel(io.BytesIO(raw), header=header_row, dtype=str)
-            if len(tmp.columns) > 2:
-                df = tmp
-                break
-        except Exception:
-            continue
-    if df.empty:
+    try:
+        if name.endswith(".csv"):
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+        else:
+            try:
+                import python_calamine
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+            except ImportError:
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+    except Exception:
         return pd.DataFrame()
-    df.columns = [_safe_str(c) for c in df.columns]
+
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    header_idx = 0
+    for i in range(min(5, len(raw_df))):
+        row_vals = [_safe_str(x) for x in raw_df.iloc[i]]
+        row_lower = [v.lower() for v in row_vals]
+        if any(h in row_lower for h in ["custom sku", "customsku", "barcode", "ean", "sku", "item status", "status"]):
+            header_idx = i
+            break
+        non_empty = sum(1 for v in row_vals if v != "")
+        if non_empty > 2 and header_idx == 0:
+            header_idx = i
+
+    df = raw_df.iloc[header_idx + 1:].copy()
+    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df.reset_index(drop=True)
     actual_cols = list(df.columns)
@@ -793,28 +794,45 @@ def load_zecom(file, country="PH"):
     preferred_article_cols = article_col_by_country.get(country, ["Article No"])
     preferred_rows = [2, 1, 0, 3] if country == "PH" else [3, 2, 1, 0]
 
-    df = pd.DataFrame()
-    for header_row in preferred_rows:
-        try:
-            if name.endswith(".csv"):
-                tmp = pd.read_csv(io.BytesIO(raw), header=header_row, dtype=str)
-            else:
-                tmp = pd.read_excel(io.BytesIO(raw), header=header_row, dtype=str)
-            tmp.columns = [_safe_str(c) for c in tmp.columns]
-            col_lower = [c.lower() for c in tmp.columns]
-            expected  = [c.lower() for c in preferred_article_cols]
-            if any(e in col_lower for e in expected):
-                df = tmp
-                break
-            if any("article" in c or "pim" in c or "style" in c for c in col_lower):
-                df = tmp
-                break
-        except Exception:
-            continue
-
-    if df.empty:
+    try:
+        if name.endswith(".csv"):
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+        else:
+            try:
+                import python_calamine
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+            except ImportError:
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+    except Exception:
         return pd.DataFrame()
 
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    header_idx = None
+    for r_idx in preferred_rows:
+        if r_idx < len(raw_df):
+            row_vals = [_safe_str(x) for x in raw_df.iloc[r_idx]]
+            row_lower = [v.lower() for v in row_vals]
+            expected  = [c.lower() for c in preferred_article_cols]
+            if any(e in row_lower for e in expected) or any("article" in c or "pim" in c or "style" in c for c in row_lower):
+                header_idx = r_idx
+                break
+
+    if header_idx is None:
+        for r_idx in range(min(6, len(raw_df))):
+            row_vals = [_safe_str(x) for x in raw_df.iloc[r_idx]]
+            row_lower = [v.lower() for v in row_vals]
+            expected  = [c.lower() for c in preferred_article_cols]
+            if any(e in row_lower for e in expected) or any("article" in c or "pim" in c or "style" in c for c in row_lower):
+                header_idx = r_idx
+                break
+
+    if header_idx is None:
+        header_idx = preferred_rows[0] if preferred_rows[0] < len(raw_df) else 0
+
+    df = raw_df.iloc[header_idx + 1:].copy()
+    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df.reset_index(drop=True)
     first_col = df.columns[0]
