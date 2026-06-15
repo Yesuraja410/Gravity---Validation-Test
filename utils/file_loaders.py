@@ -431,9 +431,29 @@ def load_shopee_status(file, country):
     if sku_col and sku_col != "SKU":
         df = df.rename(columns={sku_col: "SKU"})
 
+    # Find Parent SKU column
+    parent_col = None
+    for c in ["Parent SKU", "ParentSKU", "parent_sku", "parent sku"]:
+        if c in df.columns:
+            parent_col = c
+            break
+    if parent_col is None:
+        for c in df.columns:
+            if "parent" in c.lower() and "sku" in c.lower():
+                parent_col = c
+                break
+
     # Only apply 13-digit filter if SKU column exists and has 13-digit values
     if "SKU" in df.columns:
         df["SKU"] = df["SKU"].apply(_clean_sku)
+        
+        # Fallback to Parent SKU where SKU is blank (same as stock loader logic)
+        if parent_col:
+            mask_blank = df["SKU"] == ""
+            df.loc[mask_blank, "SKU"] = (
+                df.loc[mask_blank, parent_col].apply(_clean_sku)
+            )
+            
         has_13 = df["SKU"].str.fullmatch(r'\d{13}', na=False).any()
         if has_13:
             df = df[df["SKU"].str.fullmatch(r'\d{13}', na=False)].copy()
